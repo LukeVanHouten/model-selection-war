@@ -1,0 +1,190 @@
+---
+title: "Homework 3 Problem 3"
+subtitle: "STAT 435 Spring 2024"
+author: "Luke VanHouten"
+date: "2024-05-15"
+output: pdf_document
+header-includes:
+    - \usepackage{amsmath, amssymb}
+    - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 20)
+# , fig.width=12, fig.height=8
+library(tidyverse)
+library(DBI)
+library(leaps)
+library(glmnet)
+```
+
+------------------------------------------------------------------------
+
+### Exercises
+
+3. a.  Here is my data:
+
+```{r}
+conn <- dbConnect(RSQLite::SQLite(), dbname = "lahman_1871-2021.sqlite")
+
+query <- "
+SELECT p.playerID, W, L, p.G, p.GS, CG, SHO, SV, IPouts, H, ER, HR, BB, SO,
+   BAOpp, ERA, IBB, p.WP, HBP, BK, BFP, GF, R, SH, SF, GIDP, PO, A, E, DP
+FROM Pitching AS p, Fielding AS f
+WHERE p.playerID = f.playerID
+   AND p.yearID = f.yearID
+   AND p.stint = f.stint
+   AND p.teamID = f.teamID
+   AND p.lgID = f.lgID"
+
+data <- dbGetQuery(conn, query)
+
+grouped_df <- data %>%
+    group_by(playerID) %>%
+    summarise(across(c(W, L, G, GS, CG, SHO, SV, IPouts, H, ER, HR, BB, SO, IBB, 
+                       WP, HBP, BK, BFP, GF, R, SH, SF, GIDP, PO, A, E, DP), 
+                     \(x) sum(x, na.rm = TRUE)),
+              across(c(BAOpp, ERA), \(x) mean(x, na.rm = TRUE))) %>%
+    filter(complete.cases(.))
+
+war <- read.csv("war-pitchers.csv") %>%
+    select(player_ID, year_ID, WAR, BIP) %>%
+    filter(WAR != "NULL") %>%
+    group_by(player_ID) %>%
+    summarise(WAR = sum(as.numeric(WAR)), BIP = sum(as.numeric(BIP))) %>%
+    filter(complete.cases(.))
+
+predictors <- merge(war, grouped_df, by.x = "player_ID", by.y = "playerID") %>%
+    select(-player_ID)
+
+predictors <- predictors %>%
+        mutate(id = rownames(predictors))
+
+head(predictors)
+
+# Here is the number of predictors
+print(ncol(predictors) - 2)
+
+# Here is the number of data points
+print(nrow(predictors))
+```
+
+I chose option I, and I used the Lahman Baseball Database, which includes basic baseball statistics at the player level from 1871 to 2021. I also used a dataset of the Wins Above Replacement (WAR) statistic for pitchers from Baseball-Reference.com. I am focusing on pitchers here, and my response variable is the aforementioned WAR, which is the preferred statistic for measuring general player value. My predictors are pitching statistics such as Earned Run Average (ERA), strikeouts, opposing batting average, and others. I also included fielding statistics. WAR is computed from many of these statistics, so a fair share of them should be good predictors for it (although this should vary). My data is at the player level per their careers, but does not include their names as I am only looking at numerical data.
+
+b.  We can split the data here using an 80/20 train/test split:
+
+```{r}
+set.seed(123)
+
+train <- predictors %>%
+    sample_frac(0.8)
+test <- anti_join(predictors, train, by = "id") %>%
+    select(-id)
+
+train <- train %>%
+    select(-id)
+```
+
+We obviously have data points than predictors. Now, we can do our forward subset selection using the `step` function (instead of `regsubsets`):
+
+```{r, results = "hide"}
+base_model <- lm(WAR ~ 1, data = train)
+full_model <- lm(WAR ~ ., data = train)
+
+reduced_model <- step(base_model, scope = list(upper = full_model, lower = ~1),
+                      direction = "forward", k = 2)
+```
+
+```{r}
+step_predictions <- predict(reduced_model, newdata = test)
+
+num_predictors <- length(coef(reduced_model)) - 1
+step_error <- round(mean((test$WAR - unname(step_predictions)) ^ 2), 4)
+```
+
+There are `r num_predictors` predictors used in the reduced model and we have a test error of `r step_error`.
+
+c.  Here is the ridge regression model:
+
+```{r}
+grid <- 10 ^ seq(10, -2, length = 100)
+
+scaled_train <- scale(train[, c("WAR", names(reduced_model$coefficients)[-1])])
+
+ridge <- glmnet(scaled_train[, -1], scaled_train[, 1], alpha = 0, lambda = grid)
+cv_ridge <- cv.glmnet(scaled_train[, -1], scaled_train[, 1], alpha = 0, 
+                      type.measure = "mse", nfolds = 10, lambda = grid)
+
+coefficients <- matrix(NA, nrow = num_predictors, ncol = 100)
+for (i in 1:num_predictors) {
+    for (j in 1:100) {
+        coefficients[i, j] <- coef(ridge)[, j][i + 1]
+    }
+}
+
+plot(log(grid), coefficients[1, ], type = "l",
+     xlab = "log(lambda)", ylab="Coefficient",
+     ylim = c(min(coefficients), max(coefficients)))
+
+for (i in 2:num_predictors) {
+    points(log(grid), coefficients[i, ], type = "l")
+}
+```
+
+d.  Here we can find the $\lambda$ that gives us the smalles cross-validation error:
+
+```{r}
+lambda <- cv_ridge$lambda.min
+
+test_scaled <- scale(test[, c("WAR", names(reduced_model$coefficients)[-1])])
+
+predictions <- predict(ridge, s = lambda, newx = test_scaled[, -1])
+
+test_error <- round(mean((test_scaled[, 1] - predictions) ^ 2), 4)
+```
+
+The value of $\lambda$ that gives the smallest CV error is $\lambda =$ `r lambda`. The test error of this model is `r test_error`. This looks a lot different than the error in part b., because we standardized the data before performing ridge regression.
+
+e.  Here, we can fit a LASSO model:
+
+```{r}
+lasso <-  glmnet(scaled_train[, -1], scaled_train[, 1], alpha = 1, 
+                 lambda = grid)
+cv_lasso <- cv.glmnet(scaled_train[, -1], scaled_train[, 1], alpha = 1, 
+                      type.measure = "mse", nfolds = 10, lambda = grid)
+
+coefficients_lasso <- matrix(NA, nrow = num_predictors, ncol = 100)
+for (i in 1:num_predictors) {
+    for (j in 1:100) {
+        coefficients_lasso[i, j] <- coef(lasso)[, j][i + 1]
+    }
+}
+
+plot(log(grid), coefficients_lasso[1, ], type = "l",
+     xlab = "log(lambda)", ylab="Coefficient",
+     ylim = c(min(coefficients_lasso), max(coefficients_lasso)))
+
+for (i in 2:num_predictors) {
+    points(log(grid), coefficients_lasso[i, ], type = "l")
+}
+```
+
+```{r}
+lambda_lasso <- cv_lasso$lambda.min
+
+predictions_lasso <- predict(lasso, s = lambda, newx = test_scaled[, -1])
+
+test_error_lasso <- round(mean((test_scaled[, 1] - predictions_lasso) ^ 2), 4)
+```
+
+The value of $\lambda$ that gives the smallest CV error is $\lambda =$ `r lambda_lasso`. The test error of this model is `r test_error_lasso`. Here are the features that have a non-zero estimation coefficient:
+
+```{r}
+nonzero_coefs <- names(train[, -1])[which(rowSums(coefficients_lasso) != 0)]
+nonzero_coefs
+```
+
+There are `r length(nonzero_coefs)` of these. A lot of these being included make sense, because WAR is an accumulative baseball statistic; pitchers with longer careers are going to have a higher WAR. So the pitchers with a high WAR are going to have more wins, losses, games started, home runs given up, etc. than other pitchers with smaller careers and less WAR.
+
+I received full points on this problem.
